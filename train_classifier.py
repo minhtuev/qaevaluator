@@ -40,8 +40,10 @@ from evaluator import QAEvaluator
 from gazetteer import find_matches
 from test_pairs import TEST_PAIRS
 
-LABEL_MAP   = {"poor": 0, "acceptable": 1, "good": 2}
-LABEL_NAMES = {0: "poor", 1: "acceptable", 2: "good"}
+LABEL_MAP      = {"poor": 0, "acceptable": 1, "good": 2}
+LABEL_NAMES    = {0: "poor", 1: "acceptable", 2: "good"}
+BINARY_MAP     = {"poor": 0, "acceptable": 1, "good": 1}
+BINARY_NAMES   = {0: "poor", 1: "good/acceptable"}
 
 FEATURE_COLS = [
     "length", "repetition", "keyword_overlap", "fluency",
@@ -140,19 +142,24 @@ def load_or_build(jsonl_path: Path, regen: bool):
 
 # ── Reporting ───────────────────────────────────────────────────────────────────
 
-def _report(name: str, y_true, y_pred):
+def _report(name: str, y_true, y_pred, binary: bool = False):
     acc  = accuracy_score(y_true, y_pred)
     mac  = f1_score(y_true, y_pred, average="macro", zero_division=0)
     print(f"\n── {name}  (n={len(y_true)}, acc={acc*100:.1f}%, macro-F1={mac:.3f}) ──")
+    if binary:
+        tnames = ["poor", "good/acceptable"]
+    else:
+        tnames = ["poor", "acceptable", "good"]
     print(classification_report(
         y_true, y_pred,
-        target_names=["poor", "acceptable", "good"],
+        target_names=tnames,
         digits=3, zero_division=0,
     ))
     cm = confusion_matrix(y_true, y_pred)
-    print("Confusion matrix  (rows=true, cols=pred)  poor | acc | good")
+    header = "poor | good/acc" if binary else "poor | acc | good"
+    print(f"Confusion matrix  (rows=true, cols=pred)  {header}")
     for i, row in enumerate(cm):
-        print(f"  {['poor','acceptable','good'][i]:<12}: {row}")
+        print(f"  {tnames[i]:<16}: {row}")
 
 
 # ── Grid search ─────────────────────────────────────────────────────────────────
@@ -200,17 +207,27 @@ def main():
                         help="Rebuild feature cache from scratch")
     parser.add_argument("--no-gs", action="store_true",
                         help="Skip grid search (train default LogReg only)")
+    parser.add_argument("--binary", action="store_true",
+                        help="Collapse good+acceptable → 1, poor → 0")
     args = parser.parse_args()
 
     jsonl_path = Path(args.data)
     if not jsonl_path.exists():
         sys.exit(f"ERROR: {jsonl_path} not found.")
 
+    label_names = BINARY_NAMES if args.binary else LABEL_NAMES
+
     # ── Features ──────────────────────────────────────────────────────────────
     cache = load_or_build(jsonl_path, args.regen)
     X, y  = cache["X"], cache["y"]
+
+    if args.binary:
+        # remap: poor=0, acceptable=1, good=2  →  poor=0, good/acceptable=1
+        y = np.where(y == 0, 0, 1)
+        print("\n[binary mode]  poor=0  |  acceptable+good=1")
+
     print(f"\nDataset : {jsonl_path.name}  |  {len(y):,} examples  |  {X.shape[1]} features")
-    dist = Counter(LABEL_NAMES[i] for i in y)
+    dist = Counter(label_names[i] for i in y)
     print(f"Labels  : {dict(sorted(dist.items()))}")
 
     # ── Split 60 / 20 / 20 ────────────────────────────────────────────────────
@@ -255,9 +272,9 @@ def main():
     print("\n" + "═" * 70)
     print(f"SPLIT PERFORMANCE  — best model: {best_name}")
     print("═" * 70)
-    _report("TRAIN", y_train, best_clf.predict(X_tr_s))
-    _report("VAL",   y_val,   best_clf.predict(X_val_s))
-    _report("TEST",  y_test,  best_clf.predict(X_test_s))
+    _report("TRAIN", y_train, best_clf.predict(X_tr_s), args.binary)
+    _report("VAL",   y_val,   best_clf.predict(X_val_s), args.binary)
+    _report("TEST",  y_test,  best_clf.predict(X_test_s), args.binary)
 
     # ── Feature importance (available for tree-based / logreg) ────────────────
     print("\n── Feature importances / coefficients ──")
@@ -291,48 +308,67 @@ def main():
     print("═" * 70)
 
     bench_pairs = [(q, a) for q, a, _ in TEST_PAIRS]
-    bench_y     = np.array([LABEL_MAP[e] for _, _, e in TEST_PAIRS])
+    bench_y_3   = np.array([LABEL_MAP[e] for _, _, e in TEST_PAIRS])
+    bench_y     = np.where(bench_y_3 == 0, 0, 1) if args.binary else bench_y_3
 
     ev = QAEvaluator()
     X_bench   = extract_features(bench_pairs, ev)
     X_bench_s = scaler.transform(X_bench)
 
-    print(f"\n{'#':<4} {'PREDICTED':<12} {'EXPECTED':<12}  ANSWER (55 chars)")
-    print("─" * 85)
     bench_preds = best_clf.predict(X_bench_s)
+
+    print(f"\n{'#':<4} {'PREDICTED':<16} {'EXPECTED':<16}  ANSWER (55 chars)")
+    print("─" * 90)
     for i, (pred, exp_int, (q, a, exp_str)) in enumerate(
             zip(bench_preds, bench_y, TEST_PAIRS), 1):
-        mark = "✓" if pred == exp_int else "✗"
-        print(f"{i:<4} {LABEL_NAMES[pred]:<12} {exp_str:<12}  {mark} {a[:55]}")
+        mark     = "✓" if pred == exp_int else "✗"
+        pred_str = label_names[pred]
+        exp_disp = "poor" if exp_str == "poor" else ("good/acc" if args.binary else exp_str)
+        print(f"{i:<4} {pred_str:<16} {exp_disp:<16}  {mark} {a[:55]}")
 
     print()
-    _report(f"BENCHMARK — {best_name}", bench_y, bench_preds)
+    _report(f"BENCHMARK — {best_name}", bench_y, bench_preds, args.binary)
 
     # ── Summary comparison ─────────────────────────────────────────────────────
     bench_acc = accuracy_score(bench_y, bench_preds)
     bench_mac = f1_score(bench_y, bench_preds, average="macro", zero_division=0)
 
     print("\n" + "═" * 70)
-    print("ACCURACY COMPARISON  (93-pair benchmark)")
+    mode_tag = " [BINARY]" if args.binary else ""
+    print(f"ACCURACY COMPARISON  (93-pair benchmark){mode_tag}")
     print("═" * 70)
-    rows = [
-        ("Rule-based (run.py)",             54.8, None),
-        ("Snorkel LabelModel",              64.5, None),
-        ("Bootstrap pseudo-label LogReg",   65.6, None),
-        ("Template-data LogReg",            66.7, None),
-        (f"Grid-search {best_name} ←",      bench_acc * 100, bench_mac),
-    ]
+    if args.binary:
+        rows = [
+            ("Rule-based (run.py)",               79.6, None),  # poor recall ~74%, good/acc merged
+            (f"Grid-search {best_name} ←",        bench_acc * 100, bench_mac),
+        ]
+    else:
+        rows = [
+            ("Rule-based (run.py)",               54.8, None),
+            ("Snorkel LabelModel",                64.5, None),
+            ("Bootstrap pseudo-label LogReg",     65.6, None),
+            ("Manual-data RandomForest",          66.7, None),
+            ("Template-data GradientBoosting",    68.8, None),
+            (f"Grid-search {best_name} ←",        bench_acc * 100, bench_mac),
+        ]
     for label, acc, mac in rows:
         bar  = "█" * int(acc / 2)
         tail = f"  macro-F1={mac:.3f}" if mac is not None else ""
         print(f"  {label:<40} {acc:5.1f}%  {bar}{tail}")
 
     print("\nPer-class accuracy on 93-pair benchmark:")
-    for lstr, lint in [("good", 2), ("acceptable", 1), ("poor", 0)]:
-        mask = bench_y == lint
-        hit  = (bench_preds[mask] == lint).sum()
-        n    = mask.sum()
-        print(f"  {lstr:<12}  {hit}/{n}  ({hit/n*100:.1f}%)")
+    if args.binary:
+        for lstr, lint in [("good/acceptable", 1), ("poor", 0)]:
+            mask = bench_y == lint
+            hit  = (bench_preds[mask] == lint).sum()
+            n    = mask.sum()
+            print(f"  {lstr:<16}  {hit}/{n}  ({hit/n*100:.1f}%)")
+    else:
+        for lstr, lint in [("good", 2), ("acceptable", 1), ("poor", 0)]:
+            mask = bench_y == lint
+            hit  = (bench_preds[mask] == lint).sum()
+            n    = mask.sum()
+            print(f"  {lstr:<12}  {hit}/{n}  ({hit/n*100:.1f}%)")
 
 
 if __name__ == "__main__":

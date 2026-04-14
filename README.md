@@ -108,22 +108,48 @@ Requires `ANTHROPIC_API_KEY`. Supports `--resume` to continue partial runs.
 
 ---
 
+### 7. Binary Classifier — poor vs. good/acceptable (`train_classifier.py --binary`)
+
+Reformulates the problem as binary: **poor (0)** vs. **good or acceptable (1)**. This removes the hardest boundary (good vs. acceptable) and asks only "is this answer worth anything?"
+
+The same template dataset and grid search pipeline is used; GradientBoosting wins again.
+
+| Model | CV macro-F1 (binary) |
+|---|---|
+| GradientBoosting (lr=0.2, depth=3, n=200) | **0.983** |
+| RandomForest (entropy, depth=None) | 0.982 |
+| LogReg (C=0.1, l1) | 0.958 |
+| LinearSVC (C=1) | 0.956 |
+
+**Benchmark accuracy: 81.7%**, macro-F1=0.815 — a **+13 point jump** over the best 3-class result.
+
+| Class | Accuracy |
+|---|---|
+| good/acceptable | 86.0% (43/50) |
+| poor | 76.7% (33/43) |
+
+Remaining errors are mostly rambling filler and evasive questions that contain fluent, topically relevant text — the only "poor" subtype that genuinely resembles acceptable answers on surface features.
+
+---
+
 ## Benchmark Summary
 
 All results on the fixed 93-pair `TEST_PAIRS` benchmark:
 
 ```
-Strategy                              Accuracy   Notes
-────────────────────────────────────  ─────────  ──────────────────────────────────
-Rule-based heuristics                   54.8%    No training data
-Snorkel LabelModel                      64.5%    ~25 labeling functions, no labels
-Bootstrap pseudo-label LogReg           65.6%    Snorkel → pseudo-labels → LogReg
-Manual-data RandomForest (200 ex)       66.7%    Hand-crafted diverse examples
-Template-data GradientBoosting (5k ex)  68.8%    Best overall; narrow distribution
-LLM-generated data                      TBD      Pending API key
+Strategy                                  Accuracy   Notes
+────────────────────────────────────────  ─────────  ──────────────────────────────────
+Rule-based heuristics                       54.8%    No training data
+Snorkel LabelModel                          64.5%    ~25 labeling functions, no labels
+Bootstrap pseudo-label LogReg               65.6%    Snorkel → pseudo-labels → LogReg
+Manual-data RandomForest (200 ex)           66.7%    Hand-crafted diverse examples
+Template-data GradientBoosting (5k ex)      68.8%    Best 3-class result
+──────────────────────────────────────────────────────────────────────────────────────
+Binary GradientBoosting (poor vs. rest)     81.7%    Removes good/acceptable boundary
+LLM-generated data                          TBD      Pending API key
 ```
 
-### Per-class accuracy (best model, template GradientBoosting)
+### Per-class accuracy — 3-class best (template GradientBoosting)
 
 | Class | Accuracy | Note |
 |---|---|---|
@@ -133,7 +159,9 @@ LLM-generated data                      TBD      Pending API key
 
 ### Key finding: the acceptable ceiling
 
-The **acceptable/good boundary is the fundamental bottleneck** across every approach. Acceptable answers are fluent, grammatically correct, topically relevant, and often contain question keywords — they just omit the specific named entity. Without a reference answer or semantic grounding, surface and linguistic features alone cannot reliably distinguish "correct but vague" from "correct and specific." This ceiling (~35% recall on acceptable) was consistent across all five strategies.
+The **acceptable/good boundary is the fundamental bottleneck** in the 3-class setup. Acceptable answers are fluent, grammatically correct, topically relevant, and often contain question keywords — they just omit the specific named entity. Without a reference answer or semantic grounding, surface and linguistic features cannot reliably distinguish "correct but vague" from "correct and specific." This ~35% recall on acceptable was consistent across every 3-class strategy.
+
+**Switching to binary classification confirms this**: collapsing good+acceptable into one class jumps accuracy from 68.8% to 81.7% using the exact same features and model. The features are well-suited to detecting poor answers; the good/acceptable distinction is where information runs out.
 
 ---
 
@@ -155,12 +183,16 @@ python generate_dataset.py
 python generate_dataset_llm.py --limit 20   # smoke test
 python generate_dataset_llm.py              # full run
 
-# Train + grid search on any dataset
+# Train + grid search on any dataset (3-class)
 python train_classifier.py                          # template data (default)
 python train_classifier.py --data data/qa_manual.jsonl
 python train_classifier.py --data data/qa_llm.jsonl
 python train_classifier.py --regen                  # rebuild feature cache
 python train_classifier.py --no-gs                  # skip grid search
+
+# Binary classifier (poor vs. good/acceptable)
+python train_classifier.py --binary
+python train_classifier.py --binary --data data/qa_manual.jsonl
 ```
 
 ## File Overview
